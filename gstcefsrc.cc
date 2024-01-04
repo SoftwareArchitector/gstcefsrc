@@ -86,6 +86,147 @@ gchar* get_plugin_base_path () {
   return base_path;
 }
 
+static void gst_cef_src_log_add(GstCefSrc *src, const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  char log_buf[256];
+  vsnprintf(log_buf, sizeof (log_buf) - 1, format, args);
+  log_buf[sizeof (log_buf) - 1] = 0;
+  va_end(args);
+
+  struct timespec ts;
+  timespec_get(&ts, TIME_UTC);
+  GstClockTime time = GST_TIMESPEC_TO_TIME(ts);
+
+  GST_OBJECT_LOCK (src);
+  if (src->log_queue) {
+    src->log_queue->push(GstCefLogItem(time, log_buf));
+    while (src->log_queue->size() > 50)
+      src->log_queue->pop();
+  }
+  GST_OBJECT_UNLOCK (src);
+}
+
+static void gst_cef_src_log_flush(GstCefSrc *src) {
+  GST_OBJECT_LOCK (src);
+
+  if (src->log_queue) {
+    int index = 0;
+    while (src->log_queue->size()) {
+      GstCefLogItem log = src->log_queue->front();
+      src->log_queue->pop();
+
+      GST_WARNING_OBJECT(src, "Pre #%i: %" GST_TIME_FORMAT " %s", index, GST_TIME_ARGS(log.time), log.log.c_str());
+      index++;
+    }
+  }
+
+  GST_OBJECT_UNLOCK (src);
+}
+
+static gboolean gst_cef_src_check_time(GstCefSrc *src, gboolean audio_flag) {
+  GstClock *clock = GST_ELEMENT_CLOCK (src);
+  if (!clock) {
+    GST_WARNING_OBJECT(src, "Can't get element clock object");
+    return FALSE;
+  }
+
+  gst_object_ref (clock);
+  GstClockTime now = gst_clock_get_time (clock);
+  gst_object_unref (clock);
+
+  GstClockTime base_time = GST_ELEMENT_CAST (src)->base_time;
+  GstClockTime pipeline_time = now - base_time;
+
+  guint64 video_frame_index = src->video_frame_index;
+  GstClockTime video_frame_time = gst_util_uint64_scale (src->video_frame_index, src->vinfo.fps_d * GST_SECOND, src->vinfo.fps_n);
+  GstClockTime video_frame_duration = gst_util_uint64_scale (GST_SECOND, src->vinfo.fps_d, src->vinfo.fps_n);
+
+  GstClockTime audio_frame_time = src->audio_frame_time;
+//  GstClockTime audio_frame_duration = src->audio_frame_duration;
+
+  if ((pipeline_time >= video_frame_duration && video_frame_time < pipeline_time - video_frame_duration)
+      || video_frame_time > pipeline_time + video_frame_duration * 5) {
+
+    guint64 new_index = gst_util_uint64_scale (pipeline_time, src->vinfo.fps_n, src->vinfo.fps_d * GST_SECOND);
+
+    // If we have neither video nor audio frames from CEF, we allow the pipeline to have lags and
+    // jump forwards without warnings
+    if (audio_flag || new_index < video_frame_index || new_index > video_frame_index + 10) {
+      GST_WARNING_OBJECT(
+        src,
+        "Correct video time"
+        ", cur index=%" G_GUINT64_FORMAT
+          ", cur time=%" GST_TIME_FORMAT
+          ", new index=%" G_GUINT64_FORMAT
+          ", duration=%" GST_TIME_FORMAT
+          ", pipeline=%" GST_TIME_FORMAT,
+        video_frame_index,
+        GST_TIME_ARGS(video_frame_time),
+        new_index,
+        GST_TIME_ARGS(video_frame_duration),
+        GST_TIME_ARGS(pipeline_time)
+      );
+
+      gst_cef_src_log_flush(src);
+    }
+
+    video_frame_index = new_index;
+    video_frame_time = gst_util_uint64_scale (src->video_frame_index, src->vinfo.fps_d * GST_SECOND, src->vinfo.fps_n);
+  }
+
+  if (audio_frame_time < video_frame_time) {
+    GstClockTime new_time = video_frame_time + video_frame_duration / 2;
+
+    if (audio_flag) {
+      GST_WARNING_OBJECT(
+        src,
+        "Correct audio time"
+          ", cur time=%" GST_TIME_FORMAT
+          ", new time=%" GST_TIME_FORMAT
+//          ", duration=%" GST_TIME_FORMAT
+          ", video time=%" GST_TIME_FORMAT
+          ", video duration=%" GST_TIME_FORMAT
+          ", pipeline=%" GST_TIME_FORMAT,
+        GST_TIME_ARGS(audio_frame_time),
+        GST_TIME_ARGS(new_time),
+//        GST_TIME_ARGS(audio_frame_duration),
+        GST_TIME_ARGS(video_frame_time),
+        GST_TIME_ARGS(video_frame_duration),
+        GST_TIME_ARGS(pipeline_time)
+      );
+
+      gst_cef_src_log_flush(src);
+    }
+
+    audio_frame_time = new_time;
+  }
+
+  gst_cef_src_log_add(
+    src,
+    "Check time"
+      ", video index=%" G_GUINT64_FORMAT
+      ", video time=%" GST_TIME_FORMAT
+      ", video duration=%" GST_TIME_FORMAT
+      ", audio time=%" GST_TIME_FORMAT
+      ", pipeline=%" GST_TIME_FORMAT,
+    video_frame_index,
+    GST_TIME_ARGS(video_frame_time),
+    GST_TIME_ARGS(video_frame_duration),
+    GST_TIME_ARGS(audio_frame_time),
+    GST_TIME_ARGS(pipeline_time)
+  );
+
+  GST_OBJECT_LOCK (src);
+  //src->global_frame_time = now;
+  src->video_frame_index = video_frame_index;
+  src->audio_frame_time = audio_frame_time;
+  GST_OBJECT_UNLOCK (src);
+
+  return TRUE;
+}
+
+
 class RenderHandler : public CefRenderHandler
 {
   public:
@@ -101,7 +242,6 @@ class RenderHandler : public CefRenderHandler
 
     void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect &rect) override
     {
-	  GST_LOG_OBJECT(element, "getting view rect");
       GST_OBJECT_LOCK (element);
       rect = CefRect(0, 0, element->vinfo.width ? element->vinfo.width : DEFAULT_WIDTH, element->vinfo.height ? element->vinfo.height : DEFAULT_HEIGHT);
       GST_OBJECT_UNLOCK (element);
@@ -109,10 +249,9 @@ class RenderHandler : public CefRenderHandler
 
     void OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType type, const RectList &dirtyRects, const void * buffer, int w, int h) override
     {
+      gst_cef_src_log_add(element, "Capture video, width=%d, height=%d", w, h);
+
       GstBuffer *new_buffer;
-
-      GST_LOG_OBJECT (element, "painting, width / height: %d %d", w, h);
-
       new_buffer = gst_buffer_new_allocate (NULL, element->vinfo.width * element->vinfo.height * 4, NULL);
       gst_buffer_fill (new_buffer, 0, buffer, w * h * 4);
 
@@ -120,8 +259,6 @@ class RenderHandler : public CefRenderHandler
       gst_buffer_replace (&(element->current_buffer), new_buffer);
       gst_buffer_unref (new_buffer);
       GST_OBJECT_UNLOCK (element);
-
-      GST_LOG_OBJECT (element, "done painting");
     }
 
   private:
@@ -182,7 +319,7 @@ class AudioHandler : public CefAudioHandler
 
     mRate = params.sample_rate;
     mChannels = channels;
-    mCurrentTime = GST_CLOCK_TIME_NONE;
+    //mCurrentTime = GST_CLOCK_TIME_NONE;
 
     GST_OBJECT_LOCK (mElement);
     mElement->audio_events = g_list_append (mElement->audio_events, event);
@@ -194,11 +331,14 @@ class AudioHandler : public CefAudioHandler
                            int frames,
                            int64_t pts) override
   {
+    gst_cef_src_log_add(mElement,
+                        "Capture audio, samples=%d, time=%" GST_TIME_FORMAT,
+                        frames,
+                        GST_TIME_ARGS(mElement->audio_frame_time));
+
     GstBuffer *buf;
     GstMapInfo info;
     gint i, j;
-
-    GST_LOG_OBJECT (mElement, "Handling audio stream packet with %d frames", frames);
 
     buf = gst_buffer_new_allocate (NULL, mChannels * frames * 4, NULL);
 
@@ -212,25 +352,68 @@ class AudioHandler : public CefAudioHandler
     }
     gst_buffer_unmap (buf, &info);
 
+    // Write all audio data to the file
+    // TODO Remove for production
+    FILE *f = fopen("audio.raw", "a");
+    GstMapInfo info2;
+    gst_buffer_map (buf, &info2, GST_MAP_READ);
+    fwrite(info2.data, info2.size, 1, f);
+    gst_buffer_unmap (buf, &info2);
+    fclose(f);
+
+    GstClockTime audio_frame_duration = gst_util_uint64_scale (frames, GST_SECOND, mRate);
+
+    // First audio frame pts in buffer has to be synced with video
+    if (!mElement->audio_buffers) {
+      GstClockTime video_frame_time = gst_util_uint64_scale (mElement->video_frame_index,
+                                                             mElement->vinfo.fps_d * GST_SECOND,
+                                                             mElement->vinfo.fps_n);
+
+      GstClockTime video_frame_duration = gst_util_uint64_scale (GST_SECOND,
+                                                                 mElement->vinfo.fps_d,
+                                                                 mElement->vinfo.fps_n);
+
+      if (mElement->audio_frame_time > video_frame_time + video_frame_duration * 3) {
+        GstClockTime new_time = video_frame_time + video_frame_duration / 2;
+
+        GST_WARNING_OBJECT(
+            mElement,
+            "Correct audio time"
+            ", cur time=%" GST_TIME_FORMAT
+                ", new time=%" GST_TIME_FORMAT
+                ", duration=%" GST_TIME_FORMAT
+                ", video time=%" GST_TIME_FORMAT
+                ", video duration=%" GST_TIME_FORMAT,
+            GST_TIME_ARGS(mElement->audio_frame_time),
+            GST_TIME_ARGS(new_time),
+            GST_TIME_ARGS(audio_frame_duration),
+            GST_TIME_ARGS(video_frame_time),
+            GST_TIME_ARGS(video_frame_duration)
+        );
+
+        gst_cef_src_log_flush(mElement);
+
+        GST_OBJECT_LOCK (mElement);
+        mElement->audio_frame_time = new_time;
+        GST_OBJECT_UNLOCK (mElement);
+      }
+    }
+
     GST_OBJECT_LOCK (mElement);
 
-    if (!GST_CLOCK_TIME_IS_VALID (mCurrentTime)) {
-      mCurrentTime = gst_util_uint64_scale (mElement->n_frames,
-          mElement->vinfo.fps_d * GST_SECOND, mElement->vinfo.fps_n);
-    }
+    // TODO Correct pts has to be: audio_frame_time - audio_frame_duration + (now - global_frame_time)
+    GST_BUFFER_PTS (buf) = mElement->audio_frame_time;
+    GST_BUFFER_DTS (buf) = mElement->audio_frame_time;
+    GST_BUFFER_DURATION (buf) = audio_frame_duration;
 
-    GST_BUFFER_PTS (buf) = mCurrentTime;
-    GST_BUFFER_DURATION (buf) = gst_util_uint64_scale (frames, GST_SECOND, mRate);
-    mCurrentTime += GST_BUFFER_DURATION (buf);
+    mElement->audio_frame_time += audio_frame_duration;
+//    mElement->audio_frame_duration = audio_frame_duration;
 
-    if (!mElement->audio_buffers) {
+    if (!mElement->audio_buffers)
       mElement->audio_buffers = gst_buffer_list_new();
-    }
 
     gst_buffer_list_add (mElement->audio_buffers, buf);
     GST_OBJECT_UNLOCK (mElement);
-
-    GST_LOG_OBJECT (mElement, "Handled audio stream packet");
   }
 
   void OnAudioStreamStopped(CefRefPtr<CefBrowser> browser) override
@@ -245,11 +428,12 @@ class AudioHandler : public CefAudioHandler
   private:
 
     GstCefSrc *mElement;
-    GstClockTime mCurrentTime;
+    //GstClockTime mCurrentTime;
     gint mRate;
     gint mChannels;
     IMPLEMENT_REFCOUNTING(AudioHandler);
 };
+
 
 class DisplayHandler : public CefDisplayHandler {
 public:
@@ -287,6 +471,7 @@ private:
   GstCefSrc *mElement;
   IMPLEMENT_REFCOUNTING(DisplayHandler);
 };
+
 
 class BrowserClient :
   public CefClient,
@@ -429,10 +614,24 @@ class App : public CefApp
   GstCefSrc *src;
 };
 
+
 static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 {
   GstCefSrc *src = GST_CEF_SRC (push_src);
   GList *tmp;
+
+  GstClockTime frame_time = gst_util_uint64_scale (src->video_frame_index,
+                                                   src->vinfo.fps_d * GST_SECOND,
+                                                   src->vinfo.fps_n);
+
+  GstClockTime frame_duration = gst_util_uint64_scale (GST_SECOND,
+                                                       src->vinfo.fps_d,
+                                                       src->vinfo.fps_n);
+
+  gst_cef_src_log_add(src,
+                      "Push frame, index=%" G_GUINT64_FORMAT ", time=%" GST_TIME_FORMAT,
+                      src->video_frame_index,
+                      GST_TIME_ARGS(frame_time));
 
   GST_OBJECT_LOCK (src);
 
@@ -448,18 +647,26 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
   g_assert (src->current_buffer);
   *buf = gst_buffer_copy (src->current_buffer);
 
+  gboolean audio_flag = false;
   if (src->audio_buffers) {
     gst_buffer_add_cef_audio_meta (*buf, src->audio_buffers);
     src->audio_buffers = NULL;
+    audio_flag = true;
   }
 
-  GST_BUFFER_PTS (*buf) = gst_util_uint64_scale (src->n_frames, src->vinfo.fps_d * GST_SECOND, src->vinfo.fps_n);
-  GST_BUFFER_DURATION (*buf) = gst_util_uint64_scale (GST_SECOND, src->vinfo.fps_d, src->vinfo.fps_n);
-  src->n_frames++;
+  GST_BUFFER_PTS (*buf) = frame_time;
+  GST_BUFFER_DTS (*buf) = frame_time;
+  GST_BUFFER_DURATION (*buf) = frame_duration;
+  src->video_frame_index++;
+
   GST_OBJECT_UNLOCK (src);
+
+  if (!gst_cef_src_check_time(src, audio_flag))
+    return GST_FLOW_ERROR;
 
   return GST_FLOW_OK;
 }
+
 
 /* Once we have started a first cefsrc for this process, we start
  * a UI thread and never shut it down. We could probably refine this
@@ -595,6 +802,7 @@ gst_cef_src_start(GstBaseSrc *base_src)
 {
   static GOnce init_once = G_ONCE_INIT;
   gboolean ret = FALSE;
+
   GstCefSrc *src = GST_CEF_SRC (base_src);
   CefRefPtr<BrowserClient> browserClient;
   CefRefPtr<RenderHandler> renderHandler = new RenderHandler(src);
@@ -615,7 +823,11 @@ gst_cef_src_start(GstBaseSrc *base_src)
     goto done;
 
   GST_OBJECT_LOCK (src);
-  src->n_frames = 0;
+//  src->global_frame_time = 0;
+  src->video_frame_index = 0;
+  src->audio_frame_time = 0;
+  src->log_queue = new std::queue<GstCefLogItem>();
+//  src->audio_frame_duration = 0;
   GST_OBJECT_UNLOCK (src);
 
   browserClient = new BrowserClient(renderHandler, audioHandler, requestHandler, displayHandler, src);
@@ -650,21 +862,26 @@ gst_cef_src_stop (GstBaseSrc *base_src)
     g_mutex_unlock (&src->state_lock);
   }
 
+  GST_OBJECT_LOCK (src);
+  delete src->log_queue;
+  src->log_queue = NULL;
+  GST_OBJECT_UNLOCK(src);
+
   return TRUE;
 }
 
 static void
-gst_cef_src_get_times (GstBaseSrc * base_src, GstBuffer * buffer,
-    GstClockTime * start, GstClockTime * end)
+gst_cef_src_get_times (GstBaseSrc * base_src, GstBuffer * buffer, GstClockTime * start, GstClockTime * end)
 {
   GstClockTime timestamp = GST_BUFFER_PTS (buffer);
   GstClockTime duration = GST_BUFFER_DURATION (buffer);
 
-  *end = timestamp + duration;
   *start = timestamp;
+  *end = timestamp + duration;
 
-  GST_LOG_OBJECT (base_src, "Got times start: %" GST_TIME_FORMAT " end: %" GST_TIME_FORMAT, GST_TIME_ARGS (*start), GST_TIME_ARGS (*end));
+  // GST_LOG_OBJECT (base_src, "Got times start: %" GST_TIME_FORMAT " end: %" GST_TIME_FORMAT, GST_TIME_ARGS (*start), GST_TIME_ARGS (*end));
 }
+
 
 static gboolean
 gst_cef_src_query (GstBaseSrc * base_src, GstQuery * query)
@@ -709,7 +926,6 @@ gst_cef_src_fixate (GstBaseSrc * base_src, GstCaps * caps)
   else
     gst_structure_set (structure, "framerate", GST_TYPE_FRACTION, DEFAULT_FPS_N, DEFAULT_FPS_D, NULL);
 
-
   caps = GST_BASE_SRC_CLASS (parent_class)->fixate (base_src, caps);
 
   GST_INFO_OBJECT (base_src, "Fixated caps to %" GST_PTR_FORMAT, caps);
@@ -721,7 +937,6 @@ static gboolean
 gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
 {
   GstCefSrc *src = GST_CEF_SRC (base_src);
-  gboolean ret = TRUE;
   GstBuffer *new_buffer;
 
   GST_INFO_OBJECT (base_src, "Caps set to %" GST_PTR_FORMAT, caps);
@@ -735,8 +950,10 @@ gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
   src->browser->GetHost()->WasResized();
   GST_OBJECT_UNLOCK (src);
 
-  return ret;
+  //gst_cef_src_check_n_frames(src);
+  return TRUE;
 }
+
 
 static void
 gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
@@ -863,7 +1080,11 @@ gst_cef_src_init (GstCefSrc * src)
 {
   GstBaseSrc *base_src = GST_BASE_SRC (src);
 
-  src->n_frames = 0;
+//  src->global_frame_time = 0;
+  src->video_frame_index = 0;
+  src->audio_frame_time = 0;
+//  src->audio_frame_duration = 0;
+
   src->current_buffer = NULL;
   src->audio_buffers = NULL;
   src->audio_events = NULL;
@@ -876,6 +1097,7 @@ gst_cef_src_init (GstCefSrc * src)
 
   gst_base_src_set_format (base_src, GST_FORMAT_TIME);
   gst_base_src_set_live (base_src, TRUE);
+  gst_base_src_set_do_timestamp (base_src, FALSE);
 
   g_cond_init (&src->state_cond);
   g_mutex_init (&src->state_lock);
